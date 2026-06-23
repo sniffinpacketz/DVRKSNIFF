@@ -1176,7 +1176,8 @@ class DVRKSniff(QMainWindow):
             self._ssh_output.append("[!] Host and command are required.")
             return
         self._ssh_btn.setEnabled(False)
-        self._ssh_output.append(f"\n<span style='color:{self.settings[\"accent2\"]}'>$ {cmd}</span>")
+        a2color = self.settings["accent2"]
+        self._ssh_output.append(f"<span style='color:{a2color}'>$ {cmd}</span>")
         self._ssh_worker = SSHWorker(
             host, user, self._ssh_pass.text(),
             self._ssh_port_spin.value(), cmd,
