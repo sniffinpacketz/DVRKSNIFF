@@ -1,0 +1,76 @@
+name: Build DVRKSNIFF.exe
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install PyQt6 pyqtgraph pydivert paramiko pyinstaller
+
+      - name: Build EXE
+        shell: python
+        run: |
+          import subprocess, sys, os, glob, pydivert
+
+          pkg = os.path.dirname(pydivert.__file__)
+          binaries = []
+          for f in glob.glob(os.path.join(pkg, 'WinDivert*')):
+              binaries += ['--add-binary', f + ';pydivert']
+              print('Bundling WinDivert:', f)
+
+          cmd = [
+              sys.executable, '-m', 'PyInstaller',
+              '--onefile',
+              '--windowed',
+              '--uac-admin',
+              '--name', 'DVRKSNIFF',
+              '--icon', 'assets/icon.ico',
+              '--add-data', 'assets/icon.ico;.',
+              '--hidden-import', 'PyQt6.QtCore',
+              '--hidden-import', 'PyQt6.QtWidgets',
+              '--hidden-import', 'PyQt6.QtGui',
+              '--hidden-import', 'PyQt6.sip',
+              '--hidden-import', 'pyqtgraph',
+              '--hidden-import', 'pyqtgraph.graphicsItems',
+              '--hidden-import', 'pyqtgraph.widgets',
+              '--hidden-import', 'pydivert',
+              '--hidden-import', 'paramiko',
+              '--hidden-import', 'profiles',
+              '--hidden-import', 'engine',
+              '--clean',
+              '--noconfirm',
+          ] + binaries + ['main.py']
+
+          print('CMD:', ' '.join(cmd))
+          subprocess.run(cmd, check=True)
+
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\DVRKSNIFF.exe")) { throw "EXE not found!" }
+          $size = (Get-Item "dist\DVRKSNIFF.exe").length / 1MB
+          Write-Host "SUCCESS — DVRKSNIFF.exe is $([math]::Round($size,1)) MB"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DVRKSNIFF-exe
+          path: dist\DVRKSNIFF.exe
+          retention-days: 90
+          if-no-files-found: error
