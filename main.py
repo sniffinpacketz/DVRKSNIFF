@@ -31,6 +31,11 @@ from engine import (
     icmp_ping, scan_ports, geoip_lookup, ssh_run
 )
 
+# ── License server ────────────────────────────────────────────────────────────
+LICENSE_URL = "https://api.base44.com/api/apps/6a39f75d44e914ff4e9aa642/functions/dvrksniffAuth"
+ADMIN_USER  = "admin"
+ADMIN_PASS  = "botnet1337"   # local admin bypass — never sent to server
+
 SETTINGS_FILE = Path.home() / ".dvrksniff_settings.json"
 DEFAULT_SETTINGS = {
     "accent":       "#cc0000",
@@ -202,6 +207,558 @@ class SSHTerminalWorker(QThread):
             except Exception:
                 pass
 
+
+
+# ── Auth worker ────────────────────────────────────────────────────────────────
+
+import urllib.request as _urllib_req
+import urllib.error   as _urllib_err
+
+class AuthWorker(QThread):
+    success = pyqtSignal(dict)
+    failure = pyqtSignal(str)
+
+    def __init__(self, username, password, hwid):
+        super().__init__()
+        self.username = username
+        self.password = password
+        self.hwid     = hwid
+
+    def run(self):
+        import json as _json
+        # Local admin bypass — no server call
+        if self.username.lower() == ADMIN_USER and self.password == ADMIN_PASS:
+            self.success.emit({
+                "ok": True, "username": ADMIN_USER,
+                "plan": "lifetime", "is_admin": True,
+                "expires_at": None,
+                "message": "Admin access granted."
+            })
+            return
+        try:
+            payload = _json.dumps({
+                "action":   "login",
+                "username": self.username,
+                "password": self.password,
+                "hwid":     self.hwid,
+            }).encode()
+            req = _urllib_req.Request(
+                LICENSE_URL,
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "DVRKSNIFF/2.0"},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read().decode())
+            if data.get("ok"):
+                self.success.emit(data)
+            else:
+                self.failure.emit(data.get("message", "Authentication failed."))
+        except _urllib_err.URLError as e:
+            self.failure.emit(f"Cannot reach license server.\nCheck your internet connection.\n({e})")
+        except Exception as e:
+            self.failure.emit(f"Auth error: {e}")
+
+
+def get_hwid():
+    """Machine fingerprint — CPU ID + hostname hash."""
+    import platform, hashlib
+    raw = platform.node() + platform.processor() + platform.machine()
+    return hashlib.md5(raw.encode()).hexdigest()[:16].upper()
+
+
+# ── Login Window ───────────────────────────────────────────────────────────────
+
+class LoginWindow(QWidget):
+    login_ok = pyqtSignal(dict)   # emits user dict on success
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DVRKSNIFF — Authenticate")
+        self.setFixedSize(520, 460)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self._drag_pos = None
+        self._hwid = get_hwid()
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Title bar
+        title_bar = QWidget()
+        title_bar.setFixedHeight(44)
+        title_bar.setObjectName("titleBar")
+        tb_lay = QHBoxLayout(title_bar)
+        tb_lay.setContentsMargins(16, 0, 8, 0)
+        icon_lbl = QLabel("◈")
+        icon_lbl.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
+        icon_lbl.setStyleSheet("color:#cc0000;")
+        name_lbl = QLabel("DVRKSNIFF")
+        name_lbl.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        name_lbl.setStyleSheet("color:#cc0000;")
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setStyleSheet("background:transparent;color:#888;border:none;font-size:14px;")
+        close_btn.clicked.connect(self.close)
+        tb_lay.addWidget(icon_lbl)
+        tb_lay.addWidget(name_lbl)
+        tb_lay.addStretch()
+        tb_lay.addWidget(close_btn)
+        root.addWidget(title_bar)
+
+        # Body
+        body = QWidget()
+        body.setObjectName("body")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(48, 32, 48, 32)
+        bl.setSpacing(14)
+
+        sub = QLabel("Licensed Network Intelligence Suite")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setFont(QFont("Consolas", 9))
+        sub.setStyleSheet("color:#666;")
+        bl.addWidget(sub)
+
+        # HWID
+        hwid_lbl = QLabel(f"Machine ID: {self._hwid}")
+        hwid_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hwid_lbl.setFont(QFont("Consolas", 8))
+        hwid_lbl.setStyleSheet("color:#444;")
+        bl.addWidget(hwid_lbl)
+        bl.addSpacing(10)
+
+        # Username
+        self._user_edit = QLineEdit()
+        self._user_edit.setPlaceholderText("Username")
+        self._user_edit.setFont(QFont("Consolas", 12))
+        self._user_edit.setFixedHeight(42)
+        bl.addWidget(self._user_edit)
+
+        # Password
+        self._pass_edit = QLineEdit()
+        self._pass_edit.setPlaceholderText("Password")
+        self._pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pass_edit.setFont(QFont("Consolas", 12))
+        self._pass_edit.setFixedHeight(42)
+        self._pass_edit.returnPressed.connect(self._do_login)
+        bl.addWidget(self._pass_edit)
+
+        # Error label
+        self._err_lbl = QLabel("")
+        self._err_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._err_lbl.setFont(QFont("Consolas", 9))
+        self._err_lbl.setStyleSheet("color:#ff4444;")
+        self._err_lbl.setWordWrap(True)
+        bl.addWidget(self._err_lbl)
+
+        # Login button
+        self._login_btn = QPushButton("⚡  LOGIN")
+        self._login_btn.setFont(QFont("Consolas", 13, QFont.Weight.Bold))
+        self._login_btn.setFixedHeight(46)
+        self._login_btn.clicked.connect(self._do_login)
+        bl.addWidget(self._login_btn)
+
+        # Loading spinner label
+        self._loading_lbl = QLabel("")
+        self._loading_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._loading_lbl.setFont(QFont("Consolas", 9))
+        self._loading_lbl.setStyleSheet("color:#888;")
+        bl.addWidget(self._loading_lbl)
+
+        bl.addStretch()
+
+        # Footer
+        footer = QLabel("@botnet1337  ·  dvrksniff.com")
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        footer.setFont(QFont("Consolas", 8))
+        footer.setStyleSheet("color:#333;")
+        bl.addWidget(footer)
+
+        root.addWidget(body)
+
+        # Spinning dots timer
+        self._spin_dots = 0
+        self._spin_timer = QTimer()
+        self._spin_timer.timeout.connect(self._tick_spinner)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+        QWidget { background: #080000; color: #cccccc; }
+        QWidget#titleBar { background: #110000; border-bottom: 1px solid #330000; }
+        QWidget#body { background: #080000; }
+        QLineEdit {
+            background: #0d0000;
+            color: #dddddd;
+            border: 1px solid #440000;
+            border-radius: 4px;
+            padding: 6px 12px;
+            font-family: Consolas;
+        }
+        QLineEdit:focus { border: 1px solid #cc0000; }
+        QPushButton {
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                stop:0 #880000, stop:1 #550000);
+            color: #ffffff;
+            border: 1px solid #cc0000;
+            border-radius: 4px;
+            font-family: Consolas;
+            font-weight: bold;
+        }
+        QPushButton:hover { background: #cc0000; }
+        QPushButton:disabled { background: #1a0000; color: #444; border-color: #220000; }
+        """)
+
+    def _do_login(self):
+        user = self._user_edit.text().strip()
+        pw   = self._pass_edit.text()
+        if not user or not pw:
+            self._err_lbl.setText("Enter username and password.")
+            return
+        self._err_lbl.setText("")
+        self._login_btn.setEnabled(False)
+        self._spin_dots = 0
+        self._spin_timer.start(300)
+        self._auth_worker = AuthWorker(user, pw, self._hwid)
+        self._auth_worker.success.connect(self._on_success)
+        self._auth_worker.failure.connect(self._on_failure)
+        self._auth_worker.start()
+
+    def _tick_spinner(self):
+        dots = "." * ((self._spin_dots % 4) + 1)
+        self._loading_lbl.setText(f"Authenticating{dots}")
+        self._spin_dots += 1
+
+    def _on_success(self, data):
+        self._spin_timer.stop()
+        self._loading_lbl.setText("")
+        self._login_btn.setEnabled(True)
+        self.login_ok.emit(data)
+        self.close()
+
+    def _on_failure(self, msg):
+        self._spin_timer.stop()
+        self._loading_lbl.setText("")
+        self._login_btn.setEnabled(True)
+        self._err_lbl.setText(msg)
+        self._pass_edit.clear()
+        self._pass_edit.setFocus()
+
+    # Draggable frameless window
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(self.pos() + e.globalPosition().toPoint() - self._drag_pos)
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+# ── Admin Panel Window ─────────────────────────────────────────────────────────
+
+class AdminPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("DVRKSNIFF — Admin Panel")
+        self.setMinimumSize(900, 640)
+        self._build_ui()
+        self._apply_style()
+        self._load_users()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        hdr = QHBoxLayout()
+        t = QLabel("◈ DVRKSNIFF  ADMIN PANEL")
+        t.setFont(QFont("Consolas", 16, QFont.Weight.Bold))
+        t.setStyleSheet("color:#cc0000;")
+        hdr.addWidget(t); hdr.addStretch()
+        lay.addLayout(hdr)
+
+        tabs = QTabWidget()
+        tabs.setFont(QFont("Consolas", 10))
+
+        # ── Users tab ──────────────────────────────────────────────────────
+        users_tab = QWidget()
+        ul = QVBoxLayout(users_tab)
+
+        # Create user form
+        create_grp = QGroupBox("Create New User")
+        cg = QGridLayout(create_grp)
+        self._a_user  = QLineEdit(); self._a_user.setPlaceholderText("username")
+        self._a_pass  = QLineEdit(); self._a_pass.setPlaceholderText("password")
+        self._a_email = QLineEdit(); self._a_email.setPlaceholderText("email (optional)")
+        self._a_notes = QLineEdit(); self._a_notes.setPlaceholderText("notes (optional)")
+        self._a_plan  = QComboBox()
+        self._a_plan.addItems(["monthly", "lifetime", "trial"])
+        self._a_plan.currentTextChanged.connect(self._on_plan_change)
+        self._a_expires = QLineEdit()
+        self._a_expires.setPlaceholderText("Expiry date  e.g. 2026-07-23")
+        self._a_expires.setToolTip("Leave blank for monthly (auto = +30 days), not used for lifetime")
+        for w in [self._a_user, self._a_pass, self._a_email, self._a_notes, self._a_expires]:
+            w.setFont(QFont("Consolas", 10))
+        create_btn = QPushButton("+ CREATE USER")
+        create_btn.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        create_btn.clicked.connect(self._create_user)
+        self._create_msg = QLabel("")
+        self._create_msg.setFont(QFont("Consolas", 9))
+
+        cg.addWidget(QLabel("Username:"), 0, 0); cg.addWidget(self._a_user,  0, 1)
+        cg.addWidget(QLabel("Password:"), 0, 2); cg.addWidget(self._a_pass,  0, 3)
+        cg.addWidget(QLabel("Email:"),    1, 0); cg.addWidget(self._a_email, 1, 1)
+        cg.addWidget(QLabel("Plan:"),     1, 2); cg.addWidget(self._a_plan,  1, 3)
+        cg.addWidget(QLabel("Expires:"),  2, 0); cg.addWidget(self._a_expires, 2, 1)
+        cg.addWidget(QLabel("Notes:"),    2, 2); cg.addWidget(self._a_notes, 2, 3)
+        cg.addWidget(create_btn,          3, 0, 1, 2)
+        cg.addWidget(self._create_msg,    3, 2, 1, 2)
+        ul.addWidget(create_grp)
+
+        # Users table
+        self._users_table = QTableWidget(0, 8)
+        self._users_table.setHorizontalHeaderLabels(
+            ["Username", "Email", "Plan", "Expires", "HWID", "Notes", "Created", "Actions"])
+        self._users_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._users_table.setFont(QFont("Consolas", 9))
+        self._users_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._users_table.verticalHeader().setVisible(False)
+        self._users_table.setAlternatingRowColors(True)
+        ul.addWidget(self._users_table)
+
+        action_row = QHBoxLayout()
+        refresh_btn = QPushButton("↻ Refresh")
+        refresh_btn.clicked.connect(self._load_users)
+        self._ban_btn    = QPushButton("🚫 Ban Selected")
+        self._ban_btn.clicked.connect(self._ban_user)
+        self._unban_btn  = QPushButton("✓ Unban")
+        self._unban_btn.clicked.connect(self._unban_user)
+        self._hwid_btn   = QPushButton("🔄 Reset HWID")
+        self._hwid_btn.clicked.connect(self._reset_hwid)
+        self._del_btn    = QPushButton("🗑 Delete")
+        self._del_btn.clicked.connect(self._delete_user)
+        for b in [refresh_btn, self._ban_btn, self._unban_btn, self._hwid_btn, self._del_btn]:
+            b.setFont(QFont("Consolas", 9))
+            action_row.addWidget(b)
+        action_row.addStretch()
+        ul.addLayout(action_row)
+
+        tabs.addTab(users_tab, "👥 Users")
+
+        # ── Logs tab ───────────────────────────────────────────────────────
+        logs_tab = QWidget()
+        ll = QVBoxLayout(logs_tab)
+        self._logs_table = QTableWidget(0, 6)
+        self._logs_table.setHorizontalHeaderLabels(
+            ["Time", "Username", "Action", "HWID", "IP", "Message"])
+        self._logs_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._logs_table.setFont(QFont("Consolas", 9))
+        self._logs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._logs_table.verticalHeader().setVisible(False)
+        ll.addWidget(self._logs_table)
+        refresh_logs = QPushButton("↻ Refresh Logs")
+        refresh_logs.clicked.connect(self._load_logs)
+        ll.addWidget(refresh_logs)
+        tabs.addTab(logs_tab, "📋 Login Logs")
+
+        lay.addWidget(tabs)
+        self._tabs = tabs
+        self._all_users = []
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+        QWidget { background: #080000; color: #cccccc; font-family: Consolas; }
+        QTabWidget::pane { border: 1px solid #440000; background: #0a0000; }
+        QTabBar::tab { background: #110000; color: #888; border: 1px solid #220000; padding:6px 14px; }
+        QTabBar::tab:selected { background: #1a0000; color: #cc0000; border-bottom: 2px solid #cc0000; }
+        QPushButton { background:#330000; color:#ff4444; border:1px solid #440000; border-radius:3px; padding:4px 10px; }
+        QPushButton:hover { background:#cc0000; color:#fff; }
+        QLineEdit, QComboBox { background:#0d0000; color:#ddd; border:1px solid #440000; border-radius:3px; padding:4px; }
+        QTableWidget { background:#080000; color:#ccc; gridline-color:#1a0000; border:1px solid #440000; alternate-background-color:#0d0000; }
+        QTableWidget::item:selected { background:rgba(160,0,0,0.5); }
+        QHeaderView::section { background:#180000; color:#cc0000; border:1px solid #220000; padding:4px; font-weight:bold; }
+        QGroupBox { border:1px solid #440000; border-radius:4px; margin-top:8px; padding-top:8px; background:#0a0000; color:#cc0000; }
+        QGroupBox::title { subcontrol-origin:margin; left:10px; color:#cc0000; }
+        QLabel { color:#cccccc; background:transparent; }
+        QComboBox QAbstractItemView { background:#1a0000; color:#ddd; selection-background-color:#cc0000; }
+        """)
+
+    def _on_plan_change(self, plan):
+        if plan == "lifetime":
+            self._a_expires.setEnabled(False)
+            self._a_expires.setPlaceholderText("N/A — lifetime never expires")
+        elif plan == "monthly":
+            self._a_expires.setEnabled(True)
+            from datetime import datetime, timedelta
+            self._a_expires.setPlaceholderText(
+                (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+            )
+        else:
+            self._a_expires.setEnabled(True)
+            self._a_expires.setPlaceholderText("e.g. 2026-07-30")
+
+    def _call_api(self, payload):
+        import json as _j, urllib.request as _u
+        data = _j.dumps(payload).encode()
+        req  = _u.Request(LICENSE_URL, data=data,
+                          headers={"Content-Type": "application/json"},
+                          method="POST")
+        with _u.urlopen(req, timeout=12) as r:
+            return _j.loads(r.read().decode())
+
+    def _load_users(self):
+        try:
+            resp = self._call_api({"action": "admin_list_users",
+                                   "admin_password": "DVRKSNIFF_ADMIN_2025"})
+            if not resp.get("ok"):
+                return
+            self._all_users = resp.get("users", [])
+            self._render_users(self._all_users)
+        except Exception as e:
+            self._create_msg.setText(f"[!] {e}")
+            self._create_msg.setStyleSheet("color:#ff4444;")
+
+    def _render_users(self, users):
+        self._users_table.setRowCount(0)
+        plan_colors = {
+            "lifetime": "#ffcc00", "monthly": "#44ff44",
+            "trial": "#aaaaff",    "banned":  "#ff4444",
+        }
+        for u in users:
+            r = self._users_table.rowCount()
+            self._users_table.insertRow(r)
+            vals = [
+                u.get("username",""), u.get("email",""),
+                u.get("plan",""), u.get("expires_at","") or "∞",
+                (u.get("hwid","") or "")[:16] or "unbound",
+                u.get("notes",""),
+                (u.get("created_date","") or "")[:10],
+                u.get("id",""),
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setFont(QFont("Consolas", 9))
+                if c == 2:  # plan column
+                    item.setForeground(QColor(plan_colors.get(v, "#cccccc")))
+                self._users_table.setItem(r, c, item)
+
+    def _selected_user(self):
+        rows = self._users_table.selectedItems()
+        if not rows: return None, None
+        row = self._users_table.currentRow()
+        uid  = self._users_table.item(row, 7).text() if self._users_table.item(row, 7) else None
+        name = self._users_table.item(row, 0).text() if self._users_table.item(row, 0) else None
+        return uid, name
+
+    def _create_user(self):
+        user = self._a_user.text().strip()
+        pw   = self._a_pass.text().strip()
+        plan = self._a_plan.currentText()
+        if not user or not pw:
+            self._create_msg.setText("[!] Username and password required.")
+            self._create_msg.setStyleSheet("color:#ff4444;")
+            return
+        from datetime import datetime, timedelta
+        exp = self._a_expires.text().strip()
+        if not exp and plan == "monthly":
+            exp = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        try:
+            resp = self._call_api({
+                "action":       "admin_create_user",
+                "admin_password": "DVRKSNIFF_ADMIN_2025",
+                "new_username": user, "new_password": pw,
+                "plan":         plan, "expires_at":   exp,
+                "email":        self._a_email.text().strip(),
+                "notes":        self._a_notes.text().strip(),
+            })
+            if resp.get("ok"):
+                self._create_msg.setText(f"✓ Created: {user}")
+                self._create_msg.setStyleSheet("color:#44ff44;")
+                self._a_user.clear(); self._a_pass.clear()
+                self._a_email.clear(); self._a_notes.clear()
+                self._a_expires.clear()
+                self._load_users()
+            else:
+                self._create_msg.setText(f"[!] {resp.get('message')}")
+                self._create_msg.setStyleSheet("color:#ff4444;")
+        except Exception as e:
+            self._create_msg.setText(f"[!] {e}")
+            self._create_msg.setStyleSheet("color:#ff4444;")
+
+    def _ban_user(self):
+        uid, name = self._selected_user()
+        if not uid: return
+        try:
+            self._call_api({"action":"admin_update_user","admin_password":"DVRKSNIFF_ADMIN_2025",
+                            "user_id":uid,"ban":True})
+            self._load_users()
+        except Exception as e:
+            self._create_msg.setText(f"[!] {e}")
+
+    def _unban_user(self):
+        uid, name = self._selected_user()
+        if not uid: return
+        try:
+            self._call_api({"action":"admin_update_user","admin_password":"DVRKSNIFF_ADMIN_2025",
+                            "user_id":uid,"plan":"monthly"})
+            self._load_users()
+        except Exception as e:
+            self._create_msg.setText(f"[!] {e}")
+
+    def _reset_hwid(self):
+        uid, name = self._selected_user()
+        if not uid: return
+        try:
+            self._call_api({"action":"admin_update_user","admin_password":"DVRKSNIFF_ADMIN_2025",
+                            "user_id":uid,"reset_hwid":True})
+            self._load_users()
+        except Exception as e:
+            self._create_msg.setText(f"[!] {e}")
+
+    def _delete_user(self):
+        uid, name = self._selected_user()
+        if not uid: return
+        box = QMessageBox(self)
+        box.setWindowTitle("Confirm Delete")
+        box.setText(f"Delete user '{name}'? This cannot be undone.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            try:
+                self._call_api({"action":"admin_delete_user","admin_password":"DVRKSNIFF_ADMIN_2025",
+                                "user_id":uid})
+                self._load_users()
+            except Exception as e:
+                self._create_msg.setText(f"[!] {e}")
+
+    def _load_logs(self):
+        try:
+            resp = self._call_api({"action":"admin_logs","admin_password":"DVRKSNIFF_ADMIN_2025"})
+            logs = resp.get("logs",[])
+            self._logs_table.setRowCount(0)
+            for log in reversed(logs):
+                r = self._logs_table.rowCount()
+                self._logs_table.insertRow(r)
+                vals = [
+                    (log.get("created_date","") or "")[:19],
+                    log.get("username",""), log.get("action",""),
+                    log.get("hwid",""), log.get("ip_address",""),
+                    log.get("message",""),
+                ]
+                ok = log.get("success", True)
+                for c, v in enumerate(vals):
+                    item = QTableWidgetItem(str(v))
+                    item.setFont(QFont("Consolas", 9))
+                    if not ok:
+                        item.setForeground(QColor("#ff4444"))
+                    self._logs_table.setItem(r, c, item)
+        except Exception as e:
+            pass
 
 
 # ── ANSI escape code parser ────────────────────────────────────────────────────
@@ -536,8 +1093,10 @@ class DVRKSniff(QMainWindow):
     _pkt_sig    = pyqtSignal(dict)
     _status_sig = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, user_data=None):
         super().__init__()
+        self._user_data = user_data or {}
+        self._is_admin  = self._user_data.get("is_admin", False)
         self.settings   = load_settings()
         self.engine     = SnifferEngine(
             on_packet=lambda p: self._pkt_sig.emit(p),
@@ -587,9 +1146,25 @@ class DVRKSniff(QMainWindow):
         self._credit_lbl.setFont(QFont("Consolas", 11))
         self._status_lbl = QLabel("● IDLE")
         self._status_lbl.setFont(QFont("Consolas", 10))
+
+        # User info pill
+        uname   = self._user_data.get("username", "")
+        plan    = self._user_data.get("plan", "")
+        exp     = self._user_data.get("expires_at", "") or "∞"
+        plan_color = {"lifetime":"#ffcc00","monthly":"#44ff44","trial":"#aaaaff"}.get(plan,"#cccccc")
+        self._user_lbl = QLabel(f"  {uname}  [{plan}]  exp: {exp[:10] if exp != '∞' else '∞'}")
+        self._user_lbl.setFont(QFont("Consolas", 9))
+        self._user_lbl.setStyleSheet(f"color:{plan_color};background:rgba(20,0,0,0.7);padding:3px 8px;border-radius:3px;")
+
         hdr.addWidget(self._title_lbl)
         hdr.addWidget(self._credit_lbl)
         hdr.addStretch()
+        hdr.addWidget(self._user_lbl)
+        if self._is_admin:
+            self._admin_btn = QPushButton("⚙ ADMIN")
+            self._admin_btn.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+            self._admin_btn.clicked.connect(self._open_admin_panel)
+            hdr.addWidget(self._admin_btn)
         hdr.addWidget(self._status_lbl)
         root.addLayout(hdr)
 
@@ -1618,6 +2193,12 @@ class DVRKSniff(QMainWindow):
         else:
             self._ssh_terminal.append_text("[!] Not connected.\n")
 
+    # ── Admin panel ────────────────────────────────────────────────────────────
+
+    def _open_admin_panel(self):
+        self._admin_window = AdminPanel()
+        self._admin_window.show()
+
     # ── Theme ──────────────────────────────────────────────────────────────────
 
     def _pick_color(self, key):
@@ -1797,8 +2378,18 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    win = DVRKSniff()
-    win.show()
+    # ── Show login first ────────────────────────────────────────────────────
+    login_win = LoginWindow()
+
+    def on_login(user_data):
+        win = DVRKSniff(user_data=user_data)
+        win.show()
+        # Keep reference alive
+        app._main_win = win
+
+    login_win.login_ok.connect(on_login)
+    login_win.show()
+
     sys.exit(app.exec())
 
 
