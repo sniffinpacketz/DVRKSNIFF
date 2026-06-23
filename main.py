@@ -33,8 +33,8 @@ from engine import (
 
 # ── License server ────────────────────────────────────────────────────────────
 LICENSE_URL = "https://api.base44.com/api/apps/6a39f75d44e914ff4e9aa642/functions/dvrksniffAuth"
-ADMIN_USER  = "admin"
-ADMIN_PASS  = "botnet1337"   # local admin bypass — never sent to server
+ADMIN_USER  = "dvrk1k"
+ADMIN_PASS  = "lotus"   # local admin bypass — never sent to server
 
 SETTINGS_FILE = Path.home() / ".dvrksniff_settings.json"
 DEFAULT_SETTINGS = {
