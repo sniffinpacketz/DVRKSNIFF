@@ -90,23 +90,382 @@ class GeoWorker(QThread):
         self.result.emit(geoip_lookup(self.ip))
 
 
-class SSHWorker(QThread):
-    output = pyqtSignal(str, str)   # stdout, stderr
-    error  = pyqtSignal(str)
-    def __init__(self, host, user, password, port, command, key_path=""):
-        super().__init__()
-        self.host = host; self.user = user; self.password = password
-        self.port = port; self.command = command; self.key_path = key_path
-    def run(self):
-        out, err, error = ssh_run(
-            self.host, self.user, self.password,
-            self.port, self.command, self.key_path
-        )
-        if error:
-            self.error.emit(error)
-        else:
-            self.output.emit(out, err)
+class SSHTerminalWorker(QThread):
+    """
+    Runs a persistent paramiko interactive shell.
+    Streams data back to the terminal widget in real time.
+    """
+    data_ready  = pyqtSignal(str)   # raw output chunk
+    connected   = pyqtSignal(str)   # success message
+    error       = pyqtSignal(str)   # connection / runtime error
+    disconnected = pyqtSignal()
 
+    def __init__(self, host, user, password, port, key_path=""):
+        super().__init__()
+        self.host     = host
+        self.user     = user
+        self.password = password
+        self.port     = int(port)
+        self.key_path = key_path
+        self._channel = None
+        self._client  = None
+        self._stop    = False
+
+    def send(self, text):
+        """Send keystrokes to the remote shell."""
+        try:
+            if self._channel and not self._channel.closed:
+                self._channel.send(text)
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self._channel:
+                self._channel.close()
+            if self._client:
+                self._client.close()
+        except Exception:
+            pass
+
+    def run(self):
+        import socket as _socket
+        try:
+            import paramiko
+        except ImportError:
+            self.error.emit(
+                "[!] paramiko is not installed.\n"
+                "    Run:  pip install paramiko\n"
+                "    Then restart DVRKSNIFF."
+            )
+            return
+
+        try:
+            self._client = paramiko.SSHClient()
+            self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            kwargs = dict(hostname=self.host, port=self.port,
+                          username=self.user, timeout=15,
+                          allow_agent=True, look_for_keys=True)
+            if self.key_path and self.key_path.strip():
+                kwargs["key_filename"] = self.key_path.strip()
+                kwargs["look_for_keys"] = False
+                kwargs["allow_agent"]   = False
+            elif self.password:
+                kwargs["password"]      = self.password
+                kwargs["look_for_keys"] = False
+                kwargs["allow_agent"]   = False
+
+            self._client.connect(**kwargs)
+            self._channel = self._client.invoke_shell(
+                term="xterm-256color", width=200, height=50
+            )
+            self._channel.settimeout(0.1)
+            self.connected.emit(
+                f"\r\n\033[32m[+] Connected to {self.user}@{self.host}:{self.port}\033[0m\r\n"
+            )
+
+            buf = b""
+            while not self._stop:
+                try:
+                    chunk = self._channel.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    try:
+                        text = buf.decode("utf-8", errors="replace")
+                        buf  = b""
+                        self.data_ready.emit(text)
+                    except Exception:
+                        pass
+                except _socket.timeout:
+                    if self._channel.closed or self._channel.exit_status_ready():
+                        break
+                except Exception:
+                    break
+
+            self.disconnected.emit()
+
+        except paramiko.AuthenticationException:
+            self.error.emit("[!] Authentication failed — wrong password or key.")
+        except paramiko.SSHException as e:
+            self.error.emit(f"[!] SSH error: {e}")
+        except OSError as e:
+            self.error.emit(f"[!] Connection error: {e}")
+        except Exception as e:
+            self.error.emit(f"[!] Unexpected error: {e}")
+        finally:
+            try:
+                if self._client:
+                    self._client.close()
+            except Exception:
+                pass
+
+
+
+# ── ANSI escape code parser ────────────────────────────────────────────────────
+
+import re as _re
+
+_ANSI_RE = _re.compile(r'\x1b\[([0-9;]*)([A-Za-z])')
+
+_ANSI_FG = {
+    "30": "#1a1a1a", "31": "#ff4444", "32": "#44ff44",
+    "33": "#ffff44", "34": "#5599ff", "35": "#ff55ff",
+    "36": "#44ffff", "37": "#dddddd",
+    "90": "#666666", "91": "#ff6666", "92": "#66ff66",
+    "93": "#ffff66", "94": "#6699ff", "95": "#ff66ff",
+    "96": "#66ffff", "97": "#ffffff",
+}
+_ANSI_BG = {
+    "40": "#000000", "41": "#660000", "42": "#006600",
+    "43": "#666600", "44": "#000066", "45": "#660066",
+    "46": "#006666", "47": "#888888",
+}
+
+
+def ansi_to_html(text):
+    """
+    Convert ANSI escape sequences to HTML spans.
+    Handles: SGR color/style codes, cursor movement (strip), bell (strip).
+    """
+    result   = []
+    fg       = None
+    bg       = None
+    bold     = False
+    in_span  = False
+
+    def open_span():
+        nonlocal in_span
+        style_parts = []
+        if fg:
+            style_parts.append(f"color:{fg}")
+        if bg:
+            style_parts.append(f"background:{bg}")
+        if bold:
+            style_parts.append("font-weight:bold")
+        if style_parts:
+            result.append(f'<span style="{"; ".join(style_parts)}">')
+            in_span = True
+
+    def close_span():
+        nonlocal in_span
+        if in_span:
+            result.append("</span>")
+            in_span = False
+
+    pos = 0
+    for m in _ANSI_RE.finditer(text):
+        start, end = m.span()
+        # Append plain text before this escape
+        plain = text[pos:start]
+        if plain:
+            close_span()
+            # Escape HTML special chars
+            plain = plain.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            plain = plain.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
+            result.append(plain)
+            open_span()
+        pos = end
+
+        cmd  = m.group(2)
+        args = m.group(1)
+
+        if cmd == "m":   # SGR — colors / style
+            close_span()
+            codes = args.split(";") if args else ["0"]
+            i = 0
+            while i < len(codes):
+                c = codes[i]
+                if c in ("0", ""):
+                    fg = bg = None; bold = False
+                elif c == "1":
+                    bold = True
+                elif c == "22":
+                    bold = False
+                elif c in _ANSI_FG:
+                    fg = _ANSI_FG[c]
+                elif c in _ANSI_BG:
+                    bg = _ANSI_BG[c]
+                elif c == "38" and i + 2 < len(codes) and codes[i+1] == "5":
+                    # 256-color — just skip for now
+                    i += 2
+                elif c == "39":
+                    fg = None
+                elif c == "49":
+                    bg = None
+                i += 1
+            open_span()
+        # All other sequences (cursor movement, erase, etc.) — silently drop
+
+    # Remaining text
+    plain = text[pos:]
+    if plain:
+        close_span()
+        plain = plain.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        plain = plain.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
+        result.append(plain)
+        open_span()
+
+    close_span()
+    return "".join(result)
+
+
+# ── SSH Terminal Widget ────────────────────────────────────────────────────────
+
+class SSHTerminalWidget(QWidget):
+    """
+    A PuTTY-style terminal widget.
+    - Displays ANSI color output in a QTextEdit.
+    - Intercepts all keystrokes and emits them via send_input signal.
+    - Supports CTRL+C, CTRL+D, arrow keys, backspace, Enter.
+    - Keeps a local command history (UP/DOWN arrows to scroll).
+    """
+    send_input = pyqtSignal(str)   # raw bytes string to send to SSH channel
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._display = QTextEdit()
+        self._display.setReadOnly(True)
+        self._display.setFont(QFont("Consolas", 10))
+        self._display.setStyleSheet(
+            "background:#080000; color:#cccccc; border:1px solid #440000;"
+        )
+
+        # Input line at bottom — intercepts keystrokes
+        self._input = _TerminalInput(self)
+        self._input.setFont(QFont("Consolas", 10))
+        self._input.setPlaceholderText("Type here — keys go directly to the remote shell")
+        self._input.setStyleSheet(
+            "background:#0d0000; color:#dddddd; border:1px solid #660000; padding:4px;"
+        )
+        self._input.key_pressed.connect(self._on_key)
+
+        lay.addWidget(self._display, 1)
+        lay.addWidget(self._input)
+
+        self._history    = []
+        self._hist_idx   = 0
+        self._line_buf   = ""
+
+    def append_text(self, text):
+        """Append plain text (no ANSI)."""
+        self._display.moveCursor(QTextCursor.MoveOperation.End)
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe = safe.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "")
+        self._display.insertHtml(f'<span style="color:#aaaaaa">{safe}</span>')
+        self._display.ensureCursorVisible()
+
+    def append_ansi(self, text):
+        """Append text with ANSI color codes, rendered as HTML."""
+        self._display.moveCursor(QTextCursor.MoveOperation.End)
+        html = ansi_to_html(text)
+        self._display.insertHtml(html)
+        self._display.ensureCursorVisible()
+
+    def clear(self):
+        self._display.clear()
+        self._line_buf = ""
+
+    def _on_key(self, key, modifiers, text):
+        """
+        Route keystroke to the remote shell.
+        Builds a local echo + sends the raw sequence.
+        """
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+        if ctrl:
+            if key == Qt.Key.Key_C:
+                self.send_input.emit("\x03"); return
+            if key == Qt.Key.Key_D:
+                self.send_input.emit("\x04"); return
+            if key == Qt.Key.Key_Z:
+                self.send_input.emit("\x1a"); return
+            if key == Qt.Key.Key_L:
+                self.send_input.emit("\x0c"); return
+            if key == Qt.Key.Key_A:
+                self.send_input.emit("\x01"); return
+            if key == Qt.Key.Key_E:
+                self.send_input.emit("\x05"); return
+            if key == Qt.Key.Key_U:
+                self.send_input.emit("\x15"); return
+            if key == Qt.Key.Key_W:
+                self.send_input.emit("\x17"); return
+
+        if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            if self._line_buf.strip():
+                self._history.append(self._line_buf)
+            self._hist_idx = len(self._history)
+            self._line_buf = ""
+            self._input.clear()
+            self.send_input.emit("\r\n")
+            return
+
+        if key == Qt.Key.Key_Backspace:
+            if self._line_buf:
+                self._line_buf = self._line_buf[:-1]
+                self._input.setText(self._line_buf)
+                self._input.setCursorPosition(len(self._line_buf))
+            self.send_input.emit("\x7f")
+            return
+
+        if key == Qt.Key.Key_Up:
+            if self._history and self._hist_idx > 0:
+                self._hist_idx -= 1
+                self._line_buf = self._history[self._hist_idx]
+                self._input.setText(self._line_buf)
+                self._input.setCursorPosition(len(self._line_buf))
+            self.send_input.emit("\x1b[A")
+            return
+
+        if key == Qt.Key.Key_Down:
+            if self._hist_idx < len(self._history) - 1:
+                self._hist_idx += 1
+                self._line_buf = self._history[self._hist_idx]
+                self._input.setText(self._line_buf)
+                self._input.setCursorPosition(len(self._line_buf))
+            elif self._hist_idx == len(self._history) - 1:
+                self._hist_idx = len(self._history)
+                self._line_buf = ""
+                self._input.clear()
+            self.send_input.emit("\x1b[B")
+            return
+
+        if key == Qt.Key.Key_Left:
+            self.send_input.emit("\x1b[D"); return
+        if key == Qt.Key.Key_Right:
+            self.send_input.emit("\x1b[C"); return
+        if key == Qt.Key.Key_Home:
+            self.send_input.emit("\x1b[H"); return
+        if key == Qt.Key.Key_End:
+            self.send_input.emit("\x1b[F"); return
+        if key == Qt.Key.Key_Delete:
+            self.send_input.emit("\x1b[3~"); return
+        if key == Qt.Key.Key_Tab:
+            self.send_input.emit("\t"); return
+        if key == Qt.Key.Key_Escape:
+            self.send_input.emit("\x1b"); return
+
+        if text:
+            self._line_buf += text
+            self._input.setText(self._line_buf)
+            self._input.setCursorPosition(len(self._line_buf))
+            self.send_input.emit(text)
+
+
+class _TerminalInput(QLineEdit):
+    """QLineEdit that emits raw key events before Qt processes them."""
+    key_pressed = pyqtSignal(int, object, str)
+
+    def keyPressEvent(self, event):
+        self.key_pressed.emit(
+            event.key(), event.modifiers(), event.text()
+        )
+        # Don't call super — we manage the text buffer ourselves
 
 # ── Background Widget ──────────────────────────────────────────────────────────
 
@@ -609,67 +968,92 @@ class DVRKSniff(QMainWindow):
     def _build_ssh_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
+        lay.setSpacing(5)
 
+        # ── Connection bar ──────────────────────────────────────────────────
         conn = QGroupBox("Connection")
         cl   = QGridLayout(conn)
-        self._ssh_host = QLineEdit(); self._ssh_host.setPlaceholderText("192.168.1.1 or hostname")
-        self._ssh_user = QLineEdit(); self._ssh_user.setPlaceholderText("root")
-        self._ssh_pass = QLineEdit(); self._ssh_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._ssh_pass.setPlaceholderText("password (leave blank if using key)")
-        self._ssh_key  = QLineEdit(); self._ssh_key.setPlaceholderText("/path/to/id_rsa  (optional)")
+        cl.setSpacing(5)
+
+        self._ssh_host = QLineEdit()
+        self._ssh_host.setPlaceholderText("IP or hostname  (e.g. 192.168.1.1)")
+        self._ssh_user = QLineEdit()
+        self._ssh_user.setPlaceholderText("username")
+        self._ssh_user.setText("root")
+        self._ssh_pass = QLineEdit()
+        self._ssh_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ssh_pass.setPlaceholderText("password  (leave blank to use key file)")
+        self._ssh_key  = QLineEdit()
+        self._ssh_key.setPlaceholderText("path/to/id_rsa  (optional)")
         self._ssh_port_spin = QSpinBox()
-        self._ssh_port_spin.setRange(1, 65535); self._ssh_port_spin.setValue(22)
+        self._ssh_port_spin.setRange(1, 65535)
+        self._ssh_port_spin.setValue(22)
         for w in [self._ssh_host, self._ssh_user, self._ssh_pass, self._ssh_key]:
             w.setFont(QFont("Consolas", 10))
+
         browse_key = QPushButton("📂")
         browse_key.setFixedWidth(32)
         browse_key.clicked.connect(self._browse_key)
+
+        self._ssh_connect_btn = QPushButton("⚡ CONNECT")
+        self._ssh_connect_btn.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self._ssh_connect_btn.clicked.connect(self._ssh_connect)
+        self._ssh_disconnect_btn = QPushButton("✕ DISCONNECT")
+        self._ssh_disconnect_btn.setFont(QFont("Consolas", 10))
+        self._ssh_disconnect_btn.clicked.connect(self._ssh_disconnect)
+        self._ssh_disconnect_btn.setEnabled(False)
+        self._ssh_status_lbl = QLabel("● Disconnected")
+        self._ssh_status_lbl.setFont(QFont("Consolas", 10))
+
         cl.addWidget(QLabel("Host:"),     0, 0); cl.addWidget(self._ssh_host, 0, 1, 1, 3)
         cl.addWidget(QLabel("User:"),     1, 0); cl.addWidget(self._ssh_user, 1, 1)
         cl.addWidget(QLabel("Port:"),     1, 2); cl.addWidget(self._ssh_port_spin, 1, 3)
         cl.addWidget(QLabel("Password:"), 2, 0); cl.addWidget(self._ssh_pass, 2, 1, 1, 3)
         cl.addWidget(QLabel("Key file:"), 3, 0); cl.addWidget(self._ssh_key, 3, 1, 1, 2)
         cl.addWidget(browse_key,          3, 3)
+
+        btn_row_conn = QHBoxLayout()
+        btn_row_conn.addWidget(self._ssh_connect_btn)
+        btn_row_conn.addWidget(self._ssh_disconnect_btn)
+        btn_row_conn.addWidget(self._ssh_status_lbl)
+        btn_row_conn.addStretch()
+        cl.addLayout(btn_row_conn, 4, 0, 1, 4)
         lay.addWidget(conn)
 
-        cmd_row = QHBoxLayout()
-        self._ssh_cmd = QLineEdit()
-        self._ssh_cmd.setPlaceholderText("Enter command  (e.g. whoami)")
-        self._ssh_cmd.setFont(QFont("Consolas", 11))
-        self._ssh_cmd.returnPressed.connect(self._run_ssh)
-        self._ssh_btn = QPushButton("▶ RUN")
-        self._ssh_btn.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-        self._ssh_btn.clicked.connect(self._run_ssh)
-        clr_ssh = QPushButton("✕ Clear")
-        clr_ssh.clicked.connect(lambda: self._ssh_output.clear())
-        cmd_row.addWidget(self._ssh_cmd, 4)
-        cmd_row.addWidget(self._ssh_btn)
-        cmd_row.addWidget(clr_ssh)
-        lay.addLayout(cmd_row)
+        # ── Terminal display ─────────────────────────────────────────────────
+        self._ssh_terminal = SSHTerminalWidget()
+        self._ssh_terminal.send_input.connect(self._ssh_send_input)
+        lay.addWidget(self._ssh_terminal, 1)
 
-        self._ssh_output = QTextEdit()
-        self._ssh_output.setReadOnly(True)
-        self._ssh_output.setFont(QFont("Consolas", 10))
-        lay.addWidget(self._ssh_output)
-
-        quick = QGroupBox("Quick Commands")
+        # ── Quick-send toolbar ───────────────────────────────────────────────
+        quick = QGroupBox("Quick Commands  (click while connected to send instantly)")
         ql    = QHBoxLayout(quick)
-        for label, cmd in [
-            ("whoami",    "whoami"),
-            ("hostname",  "hostname"),
-            ("ip addr",   "ip a 2>/dev/null || ipconfig"),
-            ("netstat",   "netstat -an 2>/dev/null | head -40"),
-            ("processes", "ps aux 2>/dev/null | head -25 || tasklist"),
-            ("uptime",    "uptime 2>/dev/null || net stats workstation | head -5"),
-            ("disk",      "df -h 2>/dev/null || wmic logicaldisk get size,freespace,caption"),
-            ("users",     "who 2>/dev/null || query user"),
-            ("passwd",    "cat /etc/passwd 2>/dev/null | head -20"),
-        ]:
+        ql.setSpacing(4)
+        quick_cmds = [
+            ("whoami",    "whoami\n"),
+            ("hostname",  "hostname\n"),
+            ("ip a",      "ip a 2>/dev/null || ipconfig\n"),
+            ("netstat",   "netstat -an | head -40\n"),
+            ("ps aux",    "ps aux | head -30\n"),
+            ("ls -la",    "ls -la\n"),
+            ("uptime",    "uptime\n"),
+            ("df -h",     "df -h\n"),
+            ("env",       "env | sort\n"),
+            ("id",        "id\n"),
+            ("uname -a",  "uname -a\n"),
+            ("history",   "history | tail -20\n"),
+        ]
+        for label, cmd in quick_cmds:
             b = QPushButton(label)
             b.setFont(QFont("Consolas", 9))
-            b.clicked.connect(lambda _, c=cmd: self._ssh_quick(c))
+            b.clicked.connect(lambda _, c=cmd: self._ssh_quick_send(c))
             ql.addWidget(b)
         lay.addWidget(quick)
+
+        # State
+        self._ssh_worker = None
+        self._ssh_history = []
+        self._ssh_hist_idx = 0
 
         self._tabs.addTab(tab, "🔒 SSH")
 
@@ -1161,49 +1545,78 @@ class DVRKSniff(QMainWindow):
             self._refresh_storage_table()
             self._persist_stored_ips()
 
-    # ── SSH ────────────────────────────────────────────────────────────────────
+    # ── SSH Terminal ────────────────────────────────────────────────────────────
 
     def _browse_key(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select SSH Key", "", "All Files (*)")
         if path:
             self._ssh_key.setText(path)
 
-    def _run_ssh(self):
+    def _ssh_connect(self):
         host = self._ssh_host.text().strip()
         user = self._ssh_user.text().strip()
-        cmd  = self._ssh_cmd.text().strip()
-        if not host or not cmd:
-            self._ssh_output.append("[!] Host and command are required.")
+        if not host:
+            self._ssh_terminal.append_text("[!] Enter a host to connect to.\n")
             return
-        self._ssh_btn.setEnabled(False)
-        a2color = self.settings["accent2"]
-        self._ssh_output.append(f"<span style='color:{a2color}'>$ {cmd}</span>")
-        self._ssh_worker = SSHWorker(
-            host, user, self._ssh_pass.text(),
-            self._ssh_port_spin.value(), cmd,
-            self._ssh_key.text().strip()
+        if self._ssh_worker and self._ssh_worker.isRunning():
+            self._ssh_disconnect()
+
+        self._ssh_terminal.clear()
+        self._ssh_terminal.append_text(
+            f"[~] Connecting to {user}@{host}:{self._ssh_port_spin.value()} ...\n"
         )
-        self._ssh_worker.output.connect(self._show_ssh_output)
-        self._ssh_worker.error.connect(self._show_ssh_error)
+        self._ssh_connect_btn.setEnabled(False)
+        self._ssh_disconnect_btn.setEnabled(True)
+        self._ssh_status_lbl.setText("● Connecting...")
+
+        self._ssh_worker = SSHTerminalWorker(
+            host, user, self._ssh_pass.text(),
+            self._ssh_port_spin.value(), self._ssh_key.text().strip()
+        )
+        self._ssh_worker.connected.connect(self._ssh_on_connected)
+        self._ssh_worker.data_ready.connect(self._ssh_terminal.append_ansi)
+        self._ssh_worker.error.connect(self._ssh_on_error)
+        self._ssh_worker.disconnected.connect(self._ssh_on_disconnected)
         self._ssh_worker.start()
 
-    def _show_ssh_output(self, out, err):
-        self._ssh_btn.setEnabled(True)
-        if out.strip():
-            self._ssh_output.append(out)
-        if err.strip():
-            self._ssh_output.append(
-                f"<span style='color:#ff6666'>[STDERR] {err}</span>")
-        self._ssh_output.ensureCursorVisible()
+    def _ssh_disconnect(self):
+        if self._ssh_worker:
+            self._ssh_worker.stop()
+        self._ssh_on_disconnected()
 
-    def _show_ssh_error(self, error):
-        self._ssh_btn.setEnabled(True)
-        self._ssh_output.append(
-            f"<span style='color:#ff4444'>[ERROR] {error}</span>")
+    def _ssh_on_connected(self, msg):
+        self._ssh_terminal.append_ansi(msg)
+        a2 = self.settings["accent2"]
+        self._ssh_status_lbl.setStyleSheet(f"color:{a2}")
+        self._ssh_status_lbl.setText("● Connected")
 
-    def _ssh_quick(self, cmd):
-        self._ssh_cmd.setText(cmd)
-        self._run_ssh()
+    def _ssh_on_error(self, msg):
+        self._ssh_terminal.append_text(f"\n{msg}\n")
+        self._ssh_connect_btn.setEnabled(True)
+        self._ssh_disconnect_btn.setEnabled(False)
+        self._ssh_status_lbl.setStyleSheet("color:#ff4444")
+        self._ssh_status_lbl.setText("● Error")
+
+    def _ssh_on_disconnected(self):
+        self._ssh_terminal.append_text("\n[~] Session closed.\n")
+        self._ssh_connect_btn.setEnabled(True)
+        self._ssh_disconnect_btn.setEnabled(False)
+        self._ssh_status_lbl.setStyleSheet("color:#888888")
+        self._ssh_status_lbl.setText("● Disconnected")
+
+    def _ssh_send_input(self, text):
+        """Called by terminal widget when user presses a key."""
+        if self._ssh_worker and self._ssh_worker.isRunning():
+            self._ssh_worker.send(text)
+        else:
+            self._ssh_terminal.append_text("[!] Not connected. Press CONNECT first.\n")
+
+    def _ssh_quick_send(self, cmd):
+        """Send a pre-built command string directly to the shell."""
+        if self._ssh_worker and self._ssh_worker.isRunning():
+            self._ssh_worker.send(cmd)
+        else:
+            self._ssh_terminal.append_text("[!] Not connected.\n")
 
     # ── Theme ──────────────────────────────────────────────────────────────────
 
