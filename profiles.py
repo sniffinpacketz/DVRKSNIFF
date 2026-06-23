@@ -1,0 +1,156 @@
+# DVRKSNIFF - Packet Capture Profiles
+# Credited to @botnet1337 on IG
+
+SNIFFER_PROFILES = {
+    # ── P2P Games (WinDivert intercepts direct peer traffic) ──────────────────
+    "GTA 5 Online (P2P)": {
+        "mode": "p2p",
+        "filter": "udp and (ip.DstPort >= 6672 and ip.DstPort <= 6672 or ip.SrcPort == 6672)",
+        "ports": [6672, 61455, 61457, 61456, 61458],
+        "protocol": "udp",
+        "description": "GTA V peer-to-peer session traffic on UDP 6672",
+        "extract_peers": True,
+    },
+    "Red Dead Online (P2P)": {
+        "mode": "p2p",
+        "filter": "udp and (ip.DstPort >= 6672 and ip.DstPort <= 6672 or ip.SrcPort == 6672)",
+        "ports": [6672, 6673],
+        "protocol": "udp",
+        "description": "RDR2 peer session traffic (same Rockstar port range)",
+        "extract_peers": True,
+    },
+    "Minecraft Java (P2P)": {
+        "mode": "p2p",
+        "filter": "tcp and (ip.DstPort == 25565 or ip.SrcPort == 25565)",
+        "ports": [25565],
+        "protocol": "tcp",
+        "description": "Minecraft Java edition default port",
+        "extract_peers": True,
+    },
+    "Rust (P2P)": {
+        "mode": "p2p",
+        "filter": "udp and (ip.DstPort == 28015 or ip.SrcPort == 28015)",
+        "ports": [28015, 28016],
+        "protocol": "udp",
+        "description": "Rust game server / peer traffic",
+        "extract_peers": True,
+    },
+    "Among Us (P2P)": {
+        "mode": "p2p",
+        "filter": "udp and (ip.DstPort == 22023 or ip.SrcPort == 22023)",
+        "ports": [22023],
+        "protocol": "udp",
+        "description": "Among Us peer matchmaking traffic",
+        "extract_peers": True,
+    },
+
+    # ── Server-Based Games (dedicated servers, no direct peer IPs) ────────────
+    "Fortnite (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 7777 and ip.DstPort <= 7778 or ip.SrcPort >= 7777 and ip.SrcPort <= 7778)",
+        "ports": [7777, 7778, 9000],
+        "protocol": "udp",
+        "description": "Fortnite Epic Games server traffic",
+        "extract_peers": False,
+    },
+    "Rocket League (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 7000 and ip.DstPort <= 9000)",
+        "ports": [7000, 7777],
+        "protocol": "udp",
+        "description": "Rocket League Psyonix server traffic",
+        "extract_peers": False,
+    },
+    "COD Black Ops 3 (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 3074 and ip.DstPort <= 3075 or ip.SrcPort >= 3074 and ip.SrcPort <= 3075)",
+        "ports": [3074, 3075, 27014, 27017],
+        "protocol": "udp",
+        "description": "Call of Duty BO3 Activision server ports",
+        "extract_peers": False,
+    },
+    "Warzone (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 3074 and ip.DstPort <= 3078)",
+        "ports": [3074, 3075, 3076, 3077, 3078],
+        "protocol": "udp",
+        "description": "Warzone Activision dedicated servers",
+        "extract_peers": False,
+    },
+    "Apex Legends (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 37000 and ip.DstPort <= 40000)",
+        "ports": [37015, 37016, 37017],
+        "protocol": "udp",
+        "description": "Apex Legends EA/Respawn servers",
+        "extract_peers": False,
+    },
+    "Valorant (Server)": {
+        "mode": "server",
+        "filter": "udp and (ip.DstPort >= 7000 and ip.DstPort <= 8999)",
+        "ports": [7086, 7500, 8088],
+        "protocol": "udp",
+        "description": "Valorant Riot Games server traffic",
+        "extract_peers": False,
+    },
+
+    # ── VoIP / Call Pulling ───────────────────────────────────────────────────
+    "Discord (Call Pull)": {
+        "mode": "voip",
+        "filter": "udp and (ip.DstPort >= 50000 and ip.DstPort <= 65535 or ip.SrcPort >= 50000 and ip.SrcPort <= 65535)",
+        "ports": list(range(50000, 50020)) + [443, 80],
+        "protocol": "udp",
+        "description": "Discord WebRTC/UDP voice traffic — reveals caller IPs",
+        "extract_peers": True,
+    },
+    "Telegram (Call Pull)": {
+        "mode": "voip",
+        "filter": "udp and (ip.DstPort >= 1000 and ip.DstPort <= 1500 or ip.SrcPort >= 1000 and ip.SrcPort <= 1500)",
+        "ports": [443, 80, 1080, 5222],
+        "protocol": "udp",
+        "description": "Telegram P2P call traffic — direct UDP to peer",
+        "extract_peers": True,
+    },
+    "WhatsApp (Call Pull)": {
+        "mode": "voip",
+        "filter": "udp and (ip.DstPort >= 3478 and ip.DstPort <= 3481 or ip.SrcPort >= 3478 and ip.SrcPort <= 3481)",
+        "ports": [3478, 3479, 3480, 3481, 5349],
+        "protocol": "udp",
+        "description": "WhatsApp STUN/TURN WebRTC — reveals caller P2P IP",
+        "extract_peers": True,
+    },
+    "Snapchat Call (Pull)": {
+        "mode": "voip",
+        "filter": "udp and (ip.DstPort >= 19302 and ip.DstPort <= 19309)",
+        "ports": [19302, 19303, 19304, 19305],
+        "protocol": "udp",
+        "description": "Snapchat WebRTC STUN traffic",
+        "extract_peers": True,
+    },
+
+    # ── Catch-All ─────────────────────────────────────────────────────────────
+    "All Traffic": {
+        "mode": "all",
+        "filter": "true",
+        "ports": [],
+        "protocol": "all",
+        "description": "Capture every inbound/outbound packet",
+        "extract_peers": True,
+    },
+    "Inbound Only": {
+        "mode": "all",
+        "filter": "inbound",
+        "ports": [],
+        "protocol": "all",
+        "description": "Only incoming packets",
+        "extract_peers": True,
+    },
+    "Outbound Only": {
+        "mode": "all",
+        "filter": "outbound",
+        "ports": [],
+        "protocol": "all",
+        "description": "Only outgoing packets",
+        "extract_peers": True,
+    },
+}
